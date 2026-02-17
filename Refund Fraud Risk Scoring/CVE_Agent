@@ -1,0 +1,187 @@
+import os
+import re
+import json
+import requests
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from enum import Enum
+from typing import List, Optional
+from openai import OpenAI, RateLimitError, AuthenticationError
+
+
+# loads API keys
+load_dotenv()
+
+# call open ai key
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise SystemExit("Missing OPENAI_API_KEY (check your .env or environment variables).")
+
+# Model selection
+class OpenAIModel(str, Enum):
+        
+    GPT_41 = "gpt-4.1" # Best quality writing + strongest analysis; use when output must be "audit-ready"
+    GPT_41_MINI = "gpt-4.1-mini" # Balanced quality/cost; great for reasoning tasks like prioritization and risk ranking
+    GPT_41_NANO = "gpt-4.1-nano" # Fastest/cheapest; great for high-volume parsing, normalization, and simple grouping/deduping
+
+# Pick ONE default model for CVE agent:
+MODEL = OpenAIModel.GPT_41_MINI # recommeded default (cost + quality balance)
+
+# What this agent does (SCOPE):
+# - Takes a CVE ID
+# - Returns: what it is, affected versions, exploitability factors, fix/mitigations, and analyst questions
+
+NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+def fetch_nvd(cve_id: str) -> dict:
+    r = requests.get(NVD_API_URL, params={"cveId": cve_id}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def parse_nvd(cve_id: str, data: dict) -> dict:
+    vulns = data.get("vulnerabilities") or []
+    if not vulns:
+        return {"found": False, "status": None, "summary": None, "cvss_score": None, "cvss_vector": None, "nvd_url": f"https://nvd.nist.gov/vuln/detail/{cve_id}"}
+
+    cve = vulns[0].get("cve") or {}
+    status = cve.get("vulnStatus")  # e.g., Rejected / Deferred / Analyzed
+
+    # English description
+    summary = None
+    for d in (cve.get("descriptions") or []):
+        if d.get("lang") == "en" and d.get("value"):
+            summary = d["value"].strip()
+            break
+
+    # CVSS (prefer v3.1 then v3.0 then v2)
+    score = vector = None
+    metrics = cve.get("metrics") or {}
+    for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        arr = metrics.get(k) or []
+        if arr:
+            cvss = (arr[0].get("cvssData") or {})
+            score = cvss.get("baseScore")
+            vector = cvss.get("vectorString")
+            break
+
+    return {
+        "found": True,
+        "status": status,
+        "summary": summary,
+        "cvss_score": score,
+        "cvss_vector": vector,
+        "nvd_url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+    }
+
+
+# Output schema (agent response format)
+class CVE_Details(BaseModel):
+    cve_id: str = Field(..., description="CVE Identifier, e.g., CVE-2025-3546")
+    nvd_status: str = Field(..., description="NVD vulnStatus (Rejected/Deferred/Analyzed/etc.)")
+    summary: str = Field(..., description="What the CVE is in plan English")
+    affected_version: List[str] = Field(default_factory=list, description="Known affected version if known")
+    exploitability: str = Field(..., description="Exploitability analysis intended for defensive planning (detection/mitigation), intentionally omitting operational exploitation details.")
+    remediation: List[str] = Field(default_factory=list, description="How to fix / mitigate (patch, upgrade, config)")
+    analyst_questions: List[str] = Field(default_factory=list, description="Questions to confirm applicability")
+    sources: List[str] = Field(default_factory=list, description="Resources used for reference")
+    
+
+client = OpenAI(
+    base_url="https://openai.vocareum.com/v1",
+    api_key=api_key
+)
+
+
+def get_cve_details(cve_id: str) -> CVE_Details:
+    nvd_json = fetch_nvd(cve_id)
+    nvd = parse_nvd(cve_id, nvd_json)
+    
+    prompt = f""" 
+You are s cybersecurity professional assistant. Provide CVE details in a defensive way. Do NOT provide exploit code or step-by-step exploitation.
+
+Return only JSON that matches this schema:
+{CVE_Details.model_json_schema()}
+
+
+
+CVE: {cve_id}
+
+NVD status: {nvd["status"]}
+NVD summary: {nvd["summary"]}
+CVSS score: {nvd["cvss_score"]}
+CVSS vector: {nvd["cvss_vector"]}
+NVD link: {nvd["nvd_url"]}
+
+Include:
+- summary
+- affected_version (empty list if unknown)
+- exploitability (auth required? network reachable? user interaction? keep high-level)
+- remediation (patch/upgrade + compenstating controls)
+- analyst questions
+- sources (empty list if none)
+""".strip()
+    
+
+    try:    
+        resp = client.chat.completions.create(
+            model=MODEL.value,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content
+
+    except AuthenticationError as e:
+        raise SystemExit(
+            "Authentication Failed. If you're using Vocareum, make sure OPENAI_API_KEY is the Vocareum-provided token "
+            "and that the base_url is correct for your course environment."
+        )
+
+    except RateLimitError as e:
+        raise SystemExit(
+            "OpenAI API rate limit exceeded. Please add credits to your API usage."
+        ) from e
+    
+
+    def extract_json(text: str) -> str:
+        text = (text or "").strip()
+
+        # If wrapped in ```json ... ``` remove the fences
+        if text.startswith("```"):
+            lines = text.splitlines()
+            # drop first line (``` or ```json)
+            lines = lines[1:]
+            # drop last line if it's ```
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        return text
+        
+    json_text = extract_json(raw)
+    data = json.loads(json_text)
+    
+    
+    # Ensure NVD link is included even if the model forgets
+    if "sources" in data and isinstance(data["sources"], list):
+        if nvd["nvd_url"] not in data["sources"]:
+            data["sources"].append(nvd["nvd_url"])
+
+    return CVE_Details(**data)
+
+
+if __name__ == "__main__":
+    # accept free‑form sentences and pull out the CVE identifier
+    user_input = input("Enter a CVE or request (e.g., \"give me the cve details for CVE-2025-3546\"): ")
+    user_input = user_input.strip()
+
+    # look for a CVE-YYYY-NNNN(N) pattern anywhere in the sentence
+    match = re.search(r"(CVE-\d{4}-\d{4,5})", user_input, re.IGNORECASE)
+    if not match:
+        raise SystemExit("Invalid input; could not find a CVE identifier.")
+
+    cve = match.group(1).upper()
+
+    result = get_cve_details(cve)
+    print(result.model_dump_json(indent=2))
